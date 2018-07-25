@@ -1319,6 +1319,12 @@ copy_reg (char const *src_name, char const *dst_name,
           if (x->sparse_mode == SPARSE_AUTO && sparse_src)
             make_holes = true;
         }
+
+      /* Allocate disk to avoid repeated disk allocations */
+      if (sb.st_blocks == 0)
+	fallocate(dest_desc, FALLOC_FL_KEEP_SIZE, 0,
+		  src_open_sb.st_blocks << 9);
+
       return_val = copy_data(source_desc, src_name, &src_open_sb,
 			     dest_desc, dst_name, x, make_holes);
       if (!return_val)
