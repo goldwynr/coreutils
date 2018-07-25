@@ -999,6 +999,92 @@ is_probably_sparse (struct stat const *sb)
           && ST_NBLOCKS (*sb) < sb->st_size / ST_NBLOCKSIZE);
 }
 
+static bool
+copy_data(int src_fd, const char *src_name, const struct stat *src_sb,
+	  int dst_fd, const char *dst_name, const struct cp_options *x,
+	  bool make_holes)
+{
+  bool return_val = true;
+  char *buf;
+  char *buf_alloc = NULL;
+  /* Choose a suitable buffer size; it may be adjusted later.  */
+  size_t buf_alignment = getpagesize ();
+  size_t buf_size = io_blksize (*src_sb);
+  size_t hole_size = ST_BLKSIZE (*src_sb);
+
+  fdadvise (src_fd, 0, 0, FADVISE_SEQUENTIAL);
+
+  /* Deal with sparse files.  */
+  bool sparse_src = is_probably_sparse (src_sb);
+
+  /* If not making a sparse file, try to use a more-efficient
+     buffer size.  */
+  if (! make_holes)
+    {
+      /* Compute the least common multiple of the input and output
+         buffer sizes, adjusting for outlandish values.  */
+      size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment;
+      size_t blcm = buffer_lcm (io_blksize (*src_sb), buf_size,
+                                blcm_max);
+
+      /* Do not bother with a buffer larger than the input file, plus one
+         byte to make sure the file has not grown while reading it.  */
+      if (S_ISREG (src_sb->st_mode) && src_sb->st_size < buf_size)
+        buf_size = src_sb->st_size + 1;
+
+      /* However, stick with a block size that is a positive multiple of
+         blcm, overriding the above adjustments.  Watch out for
+         overflow.  */
+      buf_size += blcm - 1;
+      buf_size -= buf_size % blcm;
+      if (buf_size == 0 || blcm_max < buf_size)
+        buf_size = blcm;
+    }
+
+  buf_alloc = xmalloc (buf_size + buf_alignment);
+  buf = ptr_align (buf_alloc, buf_alignment);
+
+  if (sparse_src)
+    {
+      bool normal_copy_required;
+
+      /* Perform an efficient extent-based copy, falling back to the
+         standard copy only if the initial extent scan fails.  If the
+         '--sparse=never' option is specified, write all data but use
+         any extents to read more efficiently.  */
+      if (extent_copy (src_fd, dst_fd, buf, buf_size, hole_size,
+                       src_sb->st_size,
+                       make_holes ? x->sparse_mode : SPARSE_NEVER,
+                       src_name, dst_name, &normal_copy_required))
+        goto out;
+
+      if (! normal_copy_required)
+        {
+          return_val = false;
+          goto out;
+        }
+    }
+
+  off_t n_read;
+  bool wrote_hole_at_eof;
+  if (! sparse_copy (src_fd, dst_fd, buf, buf_size,
+                     make_holes ? hole_size : 0,
+                     x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
+                     UINTMAX_MAX, &n_read,
+                     &wrote_hole_at_eof))
+    {
+      return_val = false;
+    }
+  else if (wrote_hole_at_eof && ftruncate (dst_fd, n_read) < 0)
+    {
+      error (0, errno, _("failed to extend %s"), quoteaf (dst_name));
+      return_val = false;
+    }
+out:
+  free (buf_alloc);
+  return return_val;
+}
+
 
 /* Copy a regular file from SRC_NAME to DST_NAME.
    If the source file contains holes, copies holes and blocks of zeros
@@ -1018,8 +1104,6 @@ copy_reg (char const *src_name, char const *dst_name,
           mode_t dst_mode, mode_t omitted_permissions, bool *new_dst,
           struct stat const *src_sb)
 {
-  char *buf;
-  char *buf_alloc = NULL;
   char *name_alloc = NULL;
   int dest_desc;
   int dest_errno;
@@ -1218,14 +1302,6 @@ copy_reg (char const *src_name, char const *dst_name,
 
   if (data_copy_required)
     {
-      /* Choose a suitable buffer size; it may be adjusted later.  */
-      size_t buf_alignment = getpagesize ();
-      size_t buf_size = io_blksize (sb);
-      size_t hole_size = ST_BLKSIZE (sb);
-
-      fdadvise (source_desc, 0, 0, FADVISE_SEQUENTIAL);
-
-      /* Deal with sparse files.  */
       bool make_holes = false;
       bool sparse_src = is_probably_sparse (&src_open_sb);
 
@@ -1243,75 +1319,12 @@ copy_reg (char const *src_name, char const *dst_name,
           if (x->sparse_mode == SPARSE_AUTO && sparse_src)
             make_holes = true;
         }
-
-      /* If not making a sparse file, try to use a more-efficient
-         buffer size.  */
-      if (! make_holes)
-        {
-          /* Compute the least common multiple of the input and output
-             buffer sizes, adjusting for outlandish values.  */
-          size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment;
-          size_t blcm = buffer_lcm (io_blksize (src_open_sb), buf_size,
-                                    blcm_max);
-
-          /* Do not bother with a buffer larger than the input file, plus one
-             byte to make sure the file has not grown while reading it.  */
-          if (S_ISREG (src_open_sb.st_mode) && src_open_sb.st_size < buf_size)
-            buf_size = src_open_sb.st_size + 1;
-
-          /* However, stick with a block size that is a positive multiple of
-             blcm, overriding the above adjustments.  Watch out for
-             overflow.  */
-          buf_size += blcm - 1;
-          buf_size -= buf_size % blcm;
-          if (buf_size == 0 || blcm_max < buf_size)
-            buf_size = blcm;
-        }
-
-      buf_alloc = xmalloc (buf_size + buf_alignment);
-      buf = ptr_align (buf_alloc, buf_alignment);
-
-      if (sparse_src)
-        {
-          bool normal_copy_required;
-
-          /* Perform an efficient extent-based copy, falling back to the
-             standard copy only if the initial extent scan fails.  If the
-             '--sparse=never' option is specified, write all data but use
-             any extents to read more efficiently.  */
-          if (extent_copy (source_desc, dest_desc, buf, buf_size, hole_size,
-                           src_open_sb.st_size,
-                           make_holes ? x->sparse_mode : SPARSE_NEVER,
-                           src_name, dst_name, &normal_copy_required))
-            goto preserve_metadata;
-
-          if (! normal_copy_required)
-            {
-              return_val = false;
-              goto close_src_and_dst_desc;
-            }
-        }
-
-      off_t n_read;
-      bool wrote_hole_at_eof;
-      if (! sparse_copy (source_desc, dest_desc, buf, buf_size,
-                         make_holes ? hole_size : 0,
-                         x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
-                         UINTMAX_MAX, &n_read,
-                         &wrote_hole_at_eof))
-        {
-          return_val = false;
-          goto close_src_and_dst_desc;
-        }
-      else if (wrote_hole_at_eof && ftruncate (dest_desc, n_read) < 0)
-        {
-          error (0, errno, _("failed to extend %s"), quoteaf (dst_name));
-          return_val = false;
-          goto close_src_and_dst_desc;
-        }
+      return_val = copy_data(source_desc, src_name, &src_open_sb,
+			     dest_desc, dst_name, x, make_holes);
+      if (!return_val)
+	goto close_src_and_dst_desc;
     }
 
-preserve_metadata:
   if (x->preserve_timestamps)
     {
       struct timespec timespec[2];
@@ -1410,7 +1423,6 @@ close_src_desc:
       return_val = false;
     }
 
-  free (buf_alloc);
   free (name_alloc);
   return return_val;
 }
