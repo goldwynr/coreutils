@@ -1085,6 +1085,60 @@ out:
   return return_val;
 }
 
+#ifdef HAVE_COPY_FILE_RANGE
+static bool
+copy_range(int source_desc, const char *src_name, const struct stat *src_sb,
+	  int dest_desc, const char *dst_name, const struct cp_options *x,
+	  bool sparse_src)
+{
+  size_t len = src_sb->st_size;
+  ssize_t end, size, ret;
+  loff_t pos_in = 0, pos_out = 0;
+  int zero_desc = 0;
+  int src = source_desc;
+  int seek_mode = SEEK_HOLE;
+
+  if (len == 0)
+     return false;
+
+  if (x->sparse_mode == SPARSE_NEVER && sparse_src)
+     zero_desc = open ("/dev/zero", O_RDONLY);
+
+  while (pos_out < len)
+   {
+    end = lseek(source_desc, pos_in, seek_mode);
+
+    if (end == pos_in)
+      goto switch_mode;
+    size = end - pos_in;
+    /*
+     * Write only when we are writing data or filling holes with zeros
+     * NOT in the case of creating holes.
+     */
+    if (seek_mode == SEEK_HOLE || x->sparse_mode == SPARSE_NEVER)
+      ret = copy_file_range(src, &pos_in, dest_desc, &pos_out, size, 0);
+    else /* Set to hole size */
+      ret = size;
+    if (ret < 0)
+       return false;
+     pos_in += ret;
+     pos_out += ret;
+switch_mode:
+     if (seek_mode == SEEK_HOLE)
+      {
+	seek_mode = SEEK_DATA;
+	if (x->sparse_mode == SPARSE_NEVER)
+	  src = zero_desc;
+      }
+     else
+      {
+	seek_mode = SEEK_HOLE;
+	src = source_desc;
+      }
+   }
+  return true;
+}
+#endif /* HAVE_COPY_FILE_RANGE */
 
 /* Copy a regular file from SRC_NAME to DST_NAME.
    If the source file contains holes, copies holes and blocks of zeros
@@ -1325,12 +1379,22 @@ copy_reg (char const *src_name, char const *dst_name,
 	fallocate(dest_desc, FALLOC_FL_KEEP_SIZE, 0,
 		  src_open_sb.st_blocks << 9);
 
-      return_val = copy_data(source_desc, src_name, &src_open_sb,
-			     dest_desc, dst_name, x, make_holes);
-      if (!return_val)
-	goto close_src_and_dst_desc;
+#ifdef HAVE_COPY_FILE_RANGE
+      if (!make_holes)
+        {
+          return_val = copy_range(source_desc, src_name, &src_open_sb,
+                               dest_desc, dst_name, x, sparse_src);
+	  if (return_val)
+	    goto preserve_metadata;
+        }
+#endif
+        return_val = copy_data(source_desc, src_name, &src_open_sb,
+			       dest_desc, dst_name, x, make_holes);
+        if (!return_val)
+	  goto close_src_and_dst_desc;
     }
 
+preserve_metadata:
   if (x->preserve_timestamps)
     {
       struct timespec timespec[2];
