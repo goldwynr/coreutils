@@ -1001,8 +1001,8 @@ is_probably_sparse (struct stat const *sb)
 
 static bool
 copy_data(int src_fd, const char *src_name, const struct stat *src_sb,
-	  int dst_fd, const char *dst_name, const struct cp_options *x,
-	  bool make_holes)
+	  int dst_fd, const char *dst_name, const struct stat *dst_sb,
+	  const struct cp_options *x, bool make_holes)
 {
   bool return_val = true;
   char *buf;
@@ -1016,6 +1016,11 @@ copy_data(int src_fd, const char *src_name, const struct stat *src_sb,
 
   /* Deal with sparse files.  */
   bool sparse_src = is_probably_sparse (src_sb);
+
+  /* Allocate disk to avoid repeated disk allocations. Ignore return */
+  if (dst_sb->st_blocks == 0)
+     fallocate(dst_fd, FALLOC_FL_KEEP_SIZE, 0,
+	       src_sb->st_blocks << 9);
 
   /* If not making a sparse file, try to use a more-efficient
      buffer size.  */
@@ -1319,8 +1324,9 @@ copy_reg (char const *src_name, char const *dst_name,
           if (x->sparse_mode == SPARSE_AUTO && sparse_src)
             make_holes = true;
         }
+
       return_val = copy_data(source_desc, src_name, &src_open_sb,
-			     dest_desc, dst_name, x, make_holes);
+			     dest_desc, dst_name, &sb, x, make_holes);
       if (!return_val)
 	goto close_src_and_dst_desc;
     }
