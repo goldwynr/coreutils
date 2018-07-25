@@ -1090,6 +1090,65 @@ out:
   return return_val;
 }
 
+#ifdef HAVE_COPY_FILE_RANGE
+static bool
+copy_range(int src_fd, const char *src_name, const struct stat *src_sb,
+	  int dst_fd, const char *dst_name, const struct cp_options *x,
+	  bool sparse_src)
+{
+  size_t len = src_sb->st_size;
+  ssize_t end, size, ret;
+  loff_t pos_in = 0, pos_out = 0;
+
+  if (len == 0)
+     return false;
+
+  while (pos_out < len)
+   {
+     end = lseek(src_fd, pos_in, SEEK_HOLE);
+     if (end < 0)
+	return false;
+
+     if (end == pos_in)
+        goto hole;
+     size = end - pos_in;
+     ret = copy_file_range(src_fd, &pos_in, dst_fd, &pos_out, size, 0);
+     if (ret < 0)
+        return false;
+     if (pos_out >= len)
+	 break;
+hole:
+     end = lseek(src_fd, pos_in, SEEK_DATA);
+     if (end < 0) {
+	/* Hole at the end of file */
+	if (errno == ENXIO)
+	 {
+	   if (x->sparse_mode == SPARSE_NEVER)
+	      end = len;
+	   else
+	      break;
+	 }
+	else
+	   return false;
+     }
+     size = end - pos_in;
+     if (x->sparse_mode == SPARSE_NEVER) {
+	  if ((lseek(dst_fd, pos_out, SEEK_SET) < 0) ||
+	       !write_zeros(dst_fd, size))
+	     return false;
+     }
+     pos_in += size;
+     pos_out += size;
+   }
+
+  if ((pos_out < src_sb->st_size) && (ftruncate(dst_fd, src_sb->st_size) < 0)) {
+      error (0, errno, _("failed to extend %s"), quoteaf (dst_name));
+      return false;
+  }
+
+  return true;
+}
+#endif /* HAVE_COPY_FILE_RANGE */
 
 /* Copy a regular file from SRC_NAME to DST_NAME.
    If the source file contains holes, copies holes and blocks of zeros
@@ -1309,6 +1368,7 @@ copy_reg (char const *src_name, char const *dst_name,
     {
       bool make_holes = false;
       bool sparse_src = is_probably_sparse (&src_open_sb);
+      bool copy_range_ok = false;
 
       if (S_ISREG (sb.st_mode))
         {
@@ -1325,10 +1385,18 @@ copy_reg (char const *src_name, char const *dst_name,
             make_holes = true;
         }
 
-      return_val = copy_data(source_desc, src_name, &src_open_sb,
-			     dest_desc, dst_name, &sb, x, make_holes);
-      if (!return_val)
-	goto close_src_and_dst_desc;
+#ifdef HAVE_COPY_FILE_RANGE
+      if (!make_holes) {
+          copy_range_ok = copy_range(source_desc, src_name, &src_open_sb,
+                               dest_desc, dst_name, x, sparse_src);
+      }
+#endif
+      if (!copy_range_ok) {
+         return_val = copy_data(source_desc, src_name, &src_open_sb,
+			        dest_desc, dst_name, &sb, x, make_holes);
+         if (!return_val)
+	    goto close_src_and_dst_desc;
+      }
     }
 
   if (x->preserve_timestamps)
